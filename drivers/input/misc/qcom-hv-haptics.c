@@ -620,6 +620,7 @@ struct haptics_hw_config {
 	u32			cl_vmax_mv;
 	u32			cali_time;
 	u32			fifo_vmax_mv;
+	u32			richtap_fifo_vmax_mv;
 	u32			old_steady_vmax_mv;
 	u32			vibrator_type;
 	u32			vbat_low_soc;
@@ -5296,6 +5297,11 @@ static int haptics_parse_dt(struct haptics_chip *chip)
 		config->fifo_vmax_mv = DEFAULT_FIFO_VMAX;
 	}
 
+	rc = of_property_read_u32(node, "qcom,richtap-fifo-vmax-mv", &config->richtap_fifo_vmax_mv);
+	if (rc || config->richtap_fifo_vmax_mv >= MAX_VMAX_MV) {
+		config->richtap_fifo_vmax_mv = config->fifo_vmax_mv;
+	}
+
 	rc = of_property_read_u32(node, "qcom,old-steady-vmax-mv", &config->old_steady_vmax_mv);
 	if (rc || config->old_steady_vmax_mv >= MAX_VMAX_MV) {
 		config->old_steady_vmax_mv = DEFAULT_OLD_STEADY_VMAX;
@@ -6779,7 +6785,8 @@ static long richtap_file_unlocked_ioctl(struct file *file, unsigned int cmd, uns
 	case RICHTAP_SETTING_GAIN:
 		if (arg > 0x80)
 			arg = 0x80;
-		chip->play.vmax_mv = chip->config.fifo_vmax_mv * arg/ 128;
+		chip->play.vmax_mv = chip->config.richtap_fifo_vmax_mv * arg/ 128;
+		/* chip->play.vmax_mv = chip->config.fifo_vmax_mv * arg/ 128; */
 #ifndef OPLUS_FEATURE_CHG_BASIC
 		haptics_set_vmax_mv(chip, chip->play.vmax_mv);
 #endif
@@ -6934,6 +6941,33 @@ static ssize_t fifo_vmax_store(struct class *c,
 	return count;
 }
 static CLASS_ATTR_RW(fifo_vmax);
+
+static ssize_t richtap_fifo_vmax_show(struct class *c,
+		struct class_attribute *attr, char *buf)
+{
+	struct haptics_chip *chip = container_of(c,
+			struct haptics_chip, hap_class);
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", chip->config.richtap_fifo_vmax_mv);
+}
+
+static ssize_t richtap_fifo_vmax_store(struct class *c,
+		struct class_attribute *attr, const char *buf, size_t count)
+{
+	struct haptics_chip *chip = container_of(c,
+			struct haptics_chip, hap_class);
+	int val;
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (val > 0 && val < MAX_VMAX_MV) {
+		chip->config.richtap_fifo_vmax_mv = val;
+	}
+
+	return count;
+}
+static CLASS_ATTR_RW(richtap_fifo_vmax);
 
 static ssize_t vibrator_type_show(struct class *c,
 		struct class_attribute *attr, char *buf)
@@ -7240,6 +7274,7 @@ static struct attribute *hap_class_attrs[] = {
 	&class_attr_t_lra_us.attr,
 	&class_attr_register_write.attr,
 	&class_attr_fifo_vmax.attr,
+	&class_attr_richtap_fifo_vmax.attr,
 	&class_attr_lra_cal_cl_t_lra_us.attr,
 	&class_attr_lra_cal_rc_clk_cal_count.attr,
 	&class_attr_vibrator_type.attr,
