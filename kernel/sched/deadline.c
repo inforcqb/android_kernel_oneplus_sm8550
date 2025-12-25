@@ -17,8 +17,8 @@
  */
 #include "sched.h"
 #include "pelt.h"
-#include <trace/hooks/sched.h>
 #include <linux/cpuset.h>
+#include <trace/hooks/sched.h>
 
 struct dl_bandwidth def_dl_bandwidth;
 
@@ -2315,9 +2315,11 @@ skip:
 		double_unlock_balance(this_rq, src_rq);
 
 		if (push_task) {
+			preempt_disable();
 			raw_spin_rq_unlock(this_rq);
 			stop_one_cpu_nowait(src_rq->cpu, push_cpu_stop,
 					    push_task, &src_rq->push_work);
+			preempt_enable();
 			raw_spin_rq_lock(this_rq);
 		}
 	}
@@ -2615,7 +2617,7 @@ int sched_dl_global_validate(void)
 	 * value smaller than the currently allocated bandwidth in
 	 * any of the root_domains.
 	 */
-	for_each_possible_cpu(cpu) {
+	for_each_online_cpu(cpu) {
 		rcu_read_lock_sched();
 
 		if (dl_bw_visited(cpu, gen))

@@ -31,6 +31,10 @@
 #include <trace/hooks/dtask.h>
 #include <trace/hooks/cgroup.h>
 
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+#include <../kernel/oplus_cpu/sched/sched_tune/tune.h>
+#endif
+
 /*
  * Export tracepoints that act as a bare tracehook (ie: have no trace event
  * associated with them) to allow external modules to probe them.
@@ -96,6 +100,8 @@ const_debug unsigned int sysctl_sched_nr_migrate = 32;
  * default: 1s
  */
 unsigned int sysctl_sched_rt_period = 1000000;
+
+unsigned long stop_fair_group = 0;
 
 __read_mostly int scheduler_running;
 
@@ -661,13 +667,15 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
 #endif
 #ifdef CONFIG_PARAVIRT_TIME_ACCOUNTING
 	if (static_key_false((&paravirt_steal_rq_enabled))) {
-		steal = paravirt_steal_clock(cpu_of(rq));
+		u64 prev_steal;
+
+		steal = prev_steal = paravirt_steal_clock(cpu_of(rq));
 		steal -= rq->prev_steal_time_rq;
 
 		if (unlikely(steal > delta))
 			steal = delta;
 
-		rq->prev_steal_time_rq += steal;
+		rq->prev_steal_time_rq = prev_steal;
 		delta -= steal;
 	}
 #endif
@@ -960,10 +968,11 @@ void wake_up_q(struct wake_q_head *head)
 		struct task_struct *task;
 
 		task = container_of(node, struct task_struct, wake_q);
-		/* Task can safely be re-inserted now: */
 		node = node->next;
-		task->wake_q.next = NULL;
 		task->wake_q_count = head->count;
+		/* pairs with cmpxchg_relaxed() in __wake_q_add() */
+		WRITE_ONCE(task->wake_q.next, NULL);
+		/* Task can safely be re-inserted now. */
 
 		/*
 		 * wake_up_process() executes a full barrier, which pairs with
@@ -985,11 +994,15 @@ void wake_up_q(struct wake_q_head *head)
 void resched_curr(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
-	int cpu;
+	int cpu, need_lazy = 0;
 
 	lockdep_assert_rq_held(rq);
 
 	if (test_tsk_need_resched(curr))
+		return;
+
+	trace_android_vh_set_tsk_need_resched_lazy(curr, rq, &need_lazy);
+	if (need_lazy)
 		return;
 
 	cpu = cpu_of(rq);
@@ -1135,9 +1148,9 @@ static void nohz_csd_func(void *info)
 	WARN_ON(!(flags & NOHZ_KICK_MASK));
 
 	rq->idle_balance = idle_cpu(cpu);
-	if (rq->idle_balance && !need_resched()) {
+	if (rq->idle_balance) {
 		rq->nohz_idle_balance = flags;
-		raise_softirq_irqoff(SCHED_SOFTIRQ);
+		__raise_softirq_irqoff(SCHED_SOFTIRQ);
 	}
 }
 
@@ -2444,9 +2457,11 @@ static int migration_cpu_stop(void *data)
 		 * it.
 		 */
 		WARN_ON_ONCE(!pending->stop_pending);
+		preempt_disable();
 		task_rq_unlock(rq, p, &rf);
 		stop_one_cpu_nowait(task_cpu(p), migration_cpu_stop,
 				    &pending->arg, &pending->stop_work);
+		preempt_enable();
 		return 0;
 	}
 out:
@@ -2728,12 +2743,13 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
 			complete = true;
 		}
 
+		preempt_disable();
 		task_rq_unlock(rq, p, rf);
-
 		if (push_task) {
 			stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
 					    p, &rq->push_work);
 		}
+		preempt_enable();
 
 		if (complete)
 			complete_all(&pending->done);
@@ -2799,12 +2815,13 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
 		if (flags & SCA_MIGRATE_ENABLE)
 			p->migration_flags &= ~MDF_PUSH;
 
+		preempt_disable();
 		task_rq_unlock(rq, p, rf);
-
 		if (!stop_pending) {
 			stop_one_cpu_nowait(cpu_of(rq), migration_cpu_stop,
 					    &pending->arg, &pending->stop_work);
 		}
+		preempt_enable();
 
 		if (flags & SCA_MIGRATE_ENABLE)
 			return 0;
@@ -4323,6 +4340,7 @@ int wake_up_state(struct task_struct *p, unsigned int state)
 {
 	return try_to_wake_up(p, state, 0);
 }
+EXPORT_SYMBOL(wake_up_state);
 
 /*
  * Perform scheduler related setup for a newly forked process p.
@@ -5165,6 +5183,7 @@ unsigned int nr_running(void)
 
 	return sum;
 }
+EXPORT_SYMBOL(nr_running);
 
 /*
  * Check if only the current task is running on the CPU.
@@ -8399,7 +8418,7 @@ SYSCALL_DEFINE0(sched_yield)
 #if !defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)
 int __sched __cond_resched(void)
 {
-	if (should_resched(0)) {
+	if (should_resched(0) && !irqs_disabled()) {
 		preempt_schedule_common();
 		return 1;
 	}
@@ -9135,9 +9154,11 @@ static void balance_push(struct rq *rq)
 	 * Temporarily drop rq->lock such that we can wake-up the stop task.
 	 * Both preemption and IRQs are still disabled.
 	 */
+	preempt_disable();
 	raw_spin_rq_unlock(rq);
 	stop_one_cpu_nowait(rq->cpu, __balance_push_cpu_stop, push_task,
 			    this_cpu_ptr(&push_work));
+	preempt_enable();
 	/*
 	 * At this point need_resched() is true and we'll take the loop in
 	 * schedule(). The next pick is obviously going to be the stop task
@@ -9272,6 +9293,22 @@ static int cpuset_cpu_inactive(unsigned int cpu)
 	return 0;
 }
 
+static inline void sched_smt_present_inc(int cpu)
+{
+#ifdef CONFIG_SCHED_SMT
+	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
+		static_branch_inc_cpuslocked(&sched_smt_present);
+#endif
+}
+
+static inline void sched_smt_present_dec(int cpu)
+{
+#ifdef CONFIG_SCHED_SMT
+	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
+		static_branch_dec_cpuslocked(&sched_smt_present);
+#endif
+}
+
 int sched_cpu_activate(unsigned int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
@@ -9283,13 +9320,10 @@ int sched_cpu_activate(unsigned int cpu)
 	 */
 	balance_push_set(cpu, false);
 
-#ifdef CONFIG_SCHED_SMT
 	/*
 	 * When going up, increment the number of cores with SMT present.
 	 */
-	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
-		static_branch_inc_cpuslocked(&sched_smt_present);
-#endif
+	sched_smt_present_inc(cpu);
 	set_cpu_active(cpu, true);
 
 	if (sched_smp_initialized) {
@@ -9358,13 +9392,12 @@ int sched_cpu_deactivate(unsigned int cpu)
 	}
 	rq_unlock_irqrestore(rq, &rf);
 
-#ifdef CONFIG_SCHED_SMT
 	/*
 	 * When going down, decrement the number of cores with SMT present.
 	 */
-	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
-		static_branch_dec_cpuslocked(&sched_smt_present);
+	sched_smt_present_dec(cpu);
 
+#ifdef CONFIG_SCHED_SMT
 	sched_core_cpu_deactivate(cpu);
 #endif
 
@@ -9373,6 +9406,7 @@ int sched_cpu_deactivate(unsigned int cpu)
 
 	ret = cpuset_cpu_inactive(cpu);
 	if (ret) {
+		sched_smt_present_inc(cpu);
 		balance_push_set(cpu, false);
 		set_cpu_active(cpu, true);
 		return ret;
@@ -10109,6 +10143,11 @@ void sched_move_task(struct task_struct *tsk)
 	struct rq_flags rf;
 	struct rq *rq;
 
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+	schedtune_attach(tsk);
+#endif
+	trace_android_vh_sched_move_task(tsk);
+
 	rq = task_rq_lock(tsk, &rf);
 	update_rq_clock(rq);
 
@@ -10149,6 +10188,9 @@ cpu_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 	struct task_group *tg;
 
 	if (!parent) {
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+		schedtune_root_alloc();
+#endif
 		/* This is early initialization for the top cgroup */
 		return &root_task_group.css;
 	}
@@ -10156,7 +10198,9 @@ cpu_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 	tg = sched_create_group(parent);
 	if (IS_ERR(tg))
 		return ERR_PTR(-ENOMEM);
-
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+	schedtune_alloc(tg, parent_css);
+#endif
 	return &tg->css;
 }
 
@@ -10197,6 +10241,9 @@ static void cpu_cgroup_css_free(struct cgroup_subsys_state *css)
 	 * Relies on the RCU grace period between css_released() and this.
 	 */
 	sched_unregister_group(tg);
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+	schedtune_free(css);
+#endif
 }
 
 /*
@@ -10472,6 +10519,14 @@ static u64 cpu_shares_read_u64(struct cgroup_subsys_state *css,
 			       struct cftype *cft)
 {
 	struct task_group *tg = css_tg(css);
+
+	/*
+	 * We can't change the weight of the root cgroup.
+	 */
+	if (!tg->se[0])
+	{
+		return (u64)stop_fair_group;
+	}
 
 	return (u64) scale_load_down(tg->shares);
 }
@@ -10900,6 +10955,13 @@ static struct cftype cpu_legacy_files[] = {
 		.write_u64 = cpu_uclamp_ls_write_u64,
 	},
 #endif
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+	{
+		.name = "schedtune.boost",
+		.read_s64 = schedtune_boost_read,
+		.write_s64 = schedtune_boost_write,
+	},
+#endif
 	{ }	/* Terminate */
 };
 
@@ -11034,7 +11096,7 @@ static ssize_t cpu_max_write(struct kernfs_open_file *of,
 {
 	struct task_group *tg = css_tg(of_css(of));
 	u64 period = tg_get_cfs_period(tg);
-	u64 burst = tg_get_cfs_burst(tg);
+	u64 burst = tg->cfs_bandwidth.burst;
 	u64 quota;
 	int ret;
 
@@ -11100,6 +11162,14 @@ static struct cftype cpu_files[] = {
 		.write_u64 = cpu_uclamp_ls_write_u64,
 	},
 #endif
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+	{
+		.name = "schedtune.boost",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_s64 = schedtune_boost_read,
+		.write_s64 = schedtune_boost_write,
+	},
+#endif
 	{ }	/* terminate */
 };
 
@@ -11117,7 +11187,7 @@ struct cgroup_subsys cpu_cgrp_subsys = {
 	.early_init	= true,
 	.threaded	= true,
 };
-
+EXPORT_SYMBOL_GPL(cpu_cgrp_subsys);
 #endif	/* CONFIG_CGROUP_SCHED */
 
 void dump_cpu_task(int cpu)
