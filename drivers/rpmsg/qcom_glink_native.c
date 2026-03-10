@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2016-2017, Linaro Ltd
  * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/idr.h>
@@ -1525,7 +1525,8 @@ static int qcom_glink_native_rx(struct qcom_glink *glink, int iterations)
 			qcom_glink_rx_advance(glink, ALIGN(sizeof(msg), 8));
 			break;
 		case RPM_CMD_OPEN:
-			ret = qcom_glink_rx_defer(glink, param2);
+			/* upper 16 bits of param2 are the "prio" field */
+			ret = qcom_glink_rx_defer(glink, param2 & 0xffff);
 			break;
 		case RPM_CMD_TX_DATA:
 		case RPM_CMD_TX_DATA_CONT:
@@ -2232,6 +2233,9 @@ static void qcom_glink_rx_close_ack(struct qcom_glink *glink, unsigned int lcid)
 {
 	struct glink_channel *channel;
 	unsigned long flags;
+
+	/* To wakeup any blocking writers */
+	wake_up_all(&glink->tx_avail_notify);
 
 	spin_lock_irqsave(&glink->idr_lock, flags);
 	channel = idr_find(&glink->lcids, lcid);
