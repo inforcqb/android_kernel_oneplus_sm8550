@@ -53,6 +53,11 @@ jobs:
         path: kernel_workspace/android-kernel
         # 获取完整提交历史（用于KSU版本计算）
         fetch-depth: 0
+    - name: 检出模块
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        git submodule init
+        git submodule update --recursive
     - name: 更新 ksu
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
