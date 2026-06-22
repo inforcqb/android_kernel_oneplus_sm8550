@@ -1,0 +1,189 @@
+name: test
+
+on:
+  workflow_dispatch:  
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    # 添加写权限以创建Release
+    permissions:
+      contents: write
+    
+    steps:
+    - name: 构建编译内核环境
+      run: |
+        sudo apt-get update
+        sudo -E apt-get -y -qq install git make bc bison ccache openssl dos2unix zip kmod cpio flex libelf-dev curl libssl-dev libtfm-dev wget device-tree-compiler ca-certificates python3 python2 binutils binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace 
+
+    - name: 下载 Gcc编译器
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        
+        mkdir gcc64
+        wget -O gcc-aarch64.tar.gz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz
+        tar -C gcc64/ -zxvf gcc-aarch64.tar.gz
+    
+        mkdir gcc32
+        wget -O gcc-arm.tar.gz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz
+        tar -C gcc32/ -zxvf gcc-arm.tar.gz
+
+    - name: 下载Clang编译器
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        mkdir -p clang-aosp
+        # 下载 clang-r450784e 的归档（AOSP prebuilt 直接提供 tar.gz）
+        wget -q -O clang.tar.gz \
+          "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-r450784e.tar.gz"
+        # 解压到 clang-aosp（tar 会自动创建 bin/ 等目录）
+        tar xzf clang.tar.gz -C clang-aosp
+        rm -f clang.tar.gz
+        # 验证
+        ls clang-aosp/bin/clang --version
+
+    - name: 检出本仓库源码
+      uses: actions/checkout@v4
+      with:
+        # 检出当前仓库的当前分支
+        repository: ${{ github.repository }}
+        ref: ${{ github.ref }}
+        # 检出到指定目录
+        path: kernel_workspace/android-kernel
+        # 获取完整提交历史（用于KSU版本计算）
+        fetch-depth: 0
+    - name: 更新 ksu
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        rm -rf KernelSU
+        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s v3.2.0
+        # sed -i 's/task_work_add(tsk, cb, TWA_RESUME);/task_work_add(tsk, cb, 0);/' ./drivers/kernelsu/allowlist.c
+        cd KernelSU-Next
+        KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" 10200)
+        echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+        sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+        cd ..
+        #sed -i '/atomic_set(&current->seccomp.filter_count, 0);/d' drivers/kernelsu/core_hook.c
+
+    - name: 设置ccache缓存
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: build-kernel-mido-kernel
+        max-size: 5G
+
+    - name: 开始编译内核
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc64/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc32/bin:$PATH
+        # export KBUILD_BUILD_USER=user
+        # export KBUILD_BUILD_HOST=host
+        # export KBUILD_BUILD_TIMESTAMP="Tue Mar 4 10:16:14 CST 2025" 
+        # 防止检查构筑信息而被识别为第三方内核
+        make -s -j$(nproc --all) O=out ARCH=arm64 defconfig
+        make -j$(nproc --all) CC="ccache clang" O=out ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- LD=ld.lld
+        
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace/modules_out
+        make -j$(nproc --all) O=out ARCH=arm64 \
+          INSTALL_MOD_PATH=$GITHUB_WORKSPACE/kernel_workspace/modules_out \
+          modules_install
+
+    - name: 制作Anykernel3卡刷包
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        git clone https://github.com/Winkmoon/AnyKernel3
+        cp android-kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+        rm -rf AnyKernel3/.git* AnyKernel3/README.md
+        cd AnyKernel3
+        zip -r ../kernel-sm8550.zip .
+        
+    - name: 打包内核模块 (.ko)
+      run: |
+       cd $GITHUB_WORKSPACE/kernel_workspace
+        # 读取内核版本号（与 modules_out 中的目录名一致）
+       KERNEL_RELEASE=$(cat android-kernel/out/include/config/kernel.release)
+        MODULES_SRC="modules_out/lib/modules/$KERNEL_RELEASE"
+  
+        if [ -d "$MODULES_SRC" ]; then
+          # 打包整个模块目录（保留目录结构）
+          tar czf kernel-modules-$KERNEL_RELEASE.tar.gz \
+          -C modules_out/lib/modules \
+          "$KERNEL_RELEASE"
+          echo "模块压缩包已生成: kernel-modules-$KERNEL_RELEASE.tar.gz"
+       else
+         echo "警告：未找到模块目录 $MODULES_SRC"
+         exit 1
+       fi
+    - name: 生成版本号和构筑日期
+      id: version
+      run: |
+        BUILD_DATE=$(date +'%Y-%m-%d %H:%M:%S')
+        RELEASE_TAG="v$(date +'%Y.%m.%d')-build-${GITHUB_RUN_ID}"
+        
+        echo "BUILD_DATE=${BUILD_DATE}" >> $GITHUB_ENV
+        echo "RELEASE_TAG=${RELEASE_TAG}" >> $GITHUB_ENV
+        echo "RELEASE_NAME=ShirokoNeko Kernel ${RELEASE_TAG}" >> $GITHUB_ENV
+        
+        # 生成包含构筑日期的文件
+        echo "构建时间: ${BUILD_DATE}" > build-info.txt
+        echo "构建ID: ${GITHUB_RUN_ID}" >> build-info.txt
+        echo "提交: ${GITHUB_SHA}" >> build-info.txt
+        echo "触发分支: ${GITHUB_REF_NAME}" >> build-info.txt
+
+    - name: 创建 GitHub Release
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ env.RELEASE_TAG }}
+        name: ${{ env.RELEASE_NAME }}
+        body: |
+          ## 🚀 Kernel for 一加 ace 2 pro
+          
+          ### 构筑信息
+          - **构筑日期**: ${{ env.BUILD_DATE }}
+          - **构筑ID**: ${{ github.run_id }}
+          - **Git提交**: ${{ github.sha }}
+          - **构建分支**: ${{ github.ref_name }}
+          
+          ### 功能特性
+          ✅ 支持 KernelSU Next v3.2.0
+          ✅ Docker 容器支持
+          ✅ LXC 容器支持
+          ✅ KVM 虚拟化支持
+          ✅ Kali Nethunter 支持
+          
+          ### 刷机说明
+          1. 下载对应的刷机包
+          2. 进入 Recovery 模式
+          3. 刷入内核包
+          4. 重启设备
+          
+          ### 注意事项
+          - 仅适用于 Android 16
+          - 仅支持 sm8550 平台
+          - 刷机有风险，请提前备份
+          
+          ---
+          
+          *本构建由 GitHub Actions 自动生成*
+          
+        draft: false
+        prerelease: false
+        files: |
+          ${{ github.workspace }}/kernel_workspace/kernel-sm8550.zip
+          ${{ github.workspace }}/kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz
+          ${{ github.workspace }}/build-info.txt
+          ${{ github.workspace }}/kernel_workspace/kernel-modules-*.tar.gz
+        generate_release_notes: true
+        continue-on-error: true
+
+    - name: 上传构建产物作为工作流 artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Android12@Xinran_StarBai-构建产物
+        path: |
+          kernel_workspace/kernel-sm8550.zip
+          kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz
+          build-info.txt
+          kernel_workspace/kernel-modules-*.tar.gz
