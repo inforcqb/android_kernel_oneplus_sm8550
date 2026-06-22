@@ -43,21 +43,18 @@ jobs:
         # 验证
         ls clang-aosp/bin/clang --version
 
-    - name: 检出本仓库源码
-      uses: actions/checkout@v4
-      with:
-        # 检出当前仓库的当前分支
-        repository: ${{ github.repository }}
-        ref: ${{ github.ref }}
-        # 检出到指定目录
-        path: kernel_workspace/android-kernel
-        # 获取完整提交历史（用于KSU版本计算）
-        fetch-depth: 0
-    - name: 检出模块
+    - name: 克隆仓库并初始化子模块
       run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        git submodule init
-        git submodule update --recursive
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 克隆当前仓库（带子模块）
+        git clone --recurse-submodules \
+          https://github.com/${{ github.repository }}.git \
+          android-kernel
+        # 切换到目标分支（与触发事件的分支一致）
+        cd android-kernel
+        git checkout ${{ github.ref_name }}
+        # 如果分支不是默认分支，可能需要强制更新子模块指向
+        git submodule update --init --recursive --force
     - name: 更新 ksu
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
