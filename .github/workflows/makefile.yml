@@ -34,27 +34,20 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         mkdir -p clang-aosp
-        # 下载 clang-r450784e 的归档（AOSP prebuilt 直接提供 tar.gz）
-        wget -q -O clang.tar.gz \
-          "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-r450784e.tar.gz"
+        
+        wget -q -O clang.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-r450784e.tar.gz"
         # 解压到 clang-aosp（tar 会自动创建 bin/ 等目录）
+        
         tar xzf clang.tar.gz -C clang-aosp
         rm -f clang.tar.gz
+        
         # 验证
         ls clang-aosp/bin/clang --version
 
     - name: 克隆仓库并初始化子模块
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        # 克隆当前仓库（带子模块）
-         git clone --recurse-submodules \
-          https://github.com/${{ github.repository }}.git \
-          android-kernel
-        # 切换到目标分支（与触发事件的分支一致）
-        cd android-kernel
-        git checkout ${{ github.ref_name }}
-        # 如果分支不是默认分支，可能需要强制更新子模块指向
-        git submodule update --init --recursive --force
+        git clone --branch ${{ github.ref_name }} --recurse-submodules https://github.com/${{ github.repository }}.git android-kernel
         
     - name: 更新 ksu
       run: |
